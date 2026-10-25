@@ -14,6 +14,7 @@ from aiohttp import ClientError, web
 from aiosendspin.client import ClientListener, PairingSupport, SendspinClient
 from aiosendspin.models.core import GroupUpdateServerPayload, ServerCommandPayload
 from aiosendspin.models.player import ClientHelloPlayerSupport, SupportedAudioFormat
+from aiosendspin.noise.driver import HandshakeAbortedError
 from aiosendspin_mpris import MPRIS_AVAILABLE, SendspinMpris
 from aiosendspin.models.types import (
     Activity,
@@ -83,6 +84,7 @@ class SendspinDaemon:
         self._static_delay_ms: float = 0.0
         self._connection_lock: asyncio.Lock | None = None
         self._server_url: str | None = None
+        self._admission_timeout_logged: bool = False
         self._group_update_unsubscribe: Callable[[], None] | None = None
         self._server_command_unsubscribe: Callable[[], None] | None = None
         self._pairing_abort_unsubscribe: Callable[[], None] | None = None
@@ -355,11 +357,26 @@ class SendspinDaemon:
             if exc is not None:
                 logger.warning("Handshake with server failed: %s", exc)
             else:
-                logger.info(
-                    "Incoming connection did not complete admission "
-                    "(handshake timed out or was aborted); waiting for a retry."
-                )
+                # Admission timeouts recur on every reconnect while a server
+                # keeps redialing, so log the first at info (an unadmitted
+                # connection would otherwise be fully silent) and repeats at
+                # debug. The flag resets below once a connection is admitted.
+                if not self._admission_timeout_logged:
+                    logger.info(
+                        "Incoming connection did not complete admission "
+                        "(handshake timed out or was aborted); waiting for a retry."
+                    )
+                    self._admission_timeout_logged = True
+                else:
+                    logger.debug(
+                        "Incoming connection did not complete admission "
+                        "(handshake timed out or was aborted); waiting for a retry."
+                    )
             return
+
+        # Reaching here means the connection was admitted: re-arm the
+        # first-time info log so a later wedged spell is visible again.
+        self._admission_timeout_logged = False
 
         # Lock ensures we wait for any in-progress handshake to complete
         # before disconnecting the previous server
@@ -433,7 +450,21 @@ class SendspinDaemon:
 
                 logger.info("Reconnecting to %s", url)
 
-            except (TimeoutError, OSError, ClientError) as e:
+            except (
+                TimeoutError,
+                OSError,
+                ClientError,
+                RuntimeError,
+                HandshakeAbortedError,
+            ) as e:
+                # Retry only the connection-failure set aiosendspin's own
+                # client uses (HandshakeAbortedError, OSError, RuntimeError,
+                # TimeoutError). RuntimeError covers "server activation
+                # rejected" / "connection closed before admission". Anything
+                # outside this set is a genuine bug and is left to propagate,
+                # so the daemon exits non-zero and the shipped systemd unit
+                # (Restart=on-failure) restarts it instead of the process
+                # dying silently with exit code 0.
                 logger.warning(
                     "Connection error (%s), retrying in %.0fs",
                     type(e).__name__,
@@ -442,10 +473,6 @@ class SendspinDaemon:
 
                 await asyncio.sleep(error_backoff)
                 error_backoff = min(error_backoff * 2, max_backoff)
-
-            except Exception:
-                logger.exception("Unexpected error during connection")
-                break
 
     def _handle_server_command(self, payload: ServerCommandPayload) -> None:
         """Handle server commands for player volume/mute control."""

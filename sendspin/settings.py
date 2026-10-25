@@ -105,7 +105,13 @@ class BaseSettings:
             return
         try:
             self._settings_file.parent.mkdir(parents=True, exist_ok=True)
-            self._settings_file.write_text(json.dumps(self.to_dict(), indent=2) + "\n")
+            # Write atomically: a kill mid-write must not truncate the live
+            # file (a truncated file falls back to defaults on next load).
+            tmp_file = self._settings_file.with_suffix(self._settings_file.suffix + ".tmp")
+            tmp_file.write_text(json.dumps(self.to_dict(), indent=2) + "\n")
+            with open(tmp_file, "rb") as f:
+                os.fsync(f.fileno())
+            os.replace(tmp_file, self._settings_file)
             logger.debug("Saved settings to %s", self._settings_file)
         except OSError as e:
             logger.warning("Failed to save settings to %s: %s", self._settings_file, e)
@@ -123,6 +129,7 @@ class ClientSettings(BaseSettings):
     use_mpris: bool = True
     audio_format: str | None = None
     use_hardware_volume: bool | None = None
+    unpaired_access: bool = True
     hook_set_volume: str | None = None
     hook_start: str | None = None
     hook_stop: str | None = None
@@ -222,6 +229,7 @@ class ClientSettings(BaseSettings):
             self.use_mpris = data.get("use_mpris", True)
             self.audio_format = data.get("audio_format")
             self.use_hardware_volume = data.get("use_hardware_volume")
+            self.unpaired_access = data.get("unpaired_access", True)
             self.hook_set_volume = data.get("hook_set_volume")
             self.hook_start = data.get("hook_start")
             self.hook_stop = data.get("hook_stop")
@@ -353,8 +361,12 @@ def _load_identity(path: Path, settings_path: Path) -> Identity:
             _warn_if_upgrading_from_legacy_client_id(settings_path)
         identity = Identity.generate()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"private_key": b64url_encode(identity.private_bytes)}))
-        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+        # Create the key file with owner-only permissions from the outset:
+        # writing first and chmod-ing after leaves a window where the private
+        # key is readable by other users under a permissive umask.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, stat.S_IRUSR | stat.S_IWUSR)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"private_key": b64url_encode(identity.private_bytes)}))
         return identity
 
 
